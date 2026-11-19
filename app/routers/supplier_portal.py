@@ -1,6 +1,10 @@
+import os
+import uuid
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -10,17 +14,20 @@ from app.models.supplier import Supplier
 from app.models.admin import SupplierProfileExtension
 from app.models.supplier_portal import (
     DeliveryDispatch,
+    Notification,
     RestockRequest,
     RestockRequestItem,
     ReturnedProduct,
     ShopBranch,
     SupplierProduct,
+    SupplierProductSubmission,
 )
 from app.schemas.supplier_portal import (
     DeliveryCreate,
     DeliveryResponse,
     DeliveryStatus,
     DeliveryStatusUpdate,
+    NotificationResponse,
     RestockRequestCreate,
     RestockRequestResponse,
     RestockRequestStatusUpdate,
@@ -37,6 +44,7 @@ from app.schemas.supplier_portal import (
     SupplierProductUpdate,
     SupplierProfileResponse,
     SupplierProfileUpdate,
+    SupplierSubmissionResponse,
 )
 from app.security import require_admin, require_supplier_access
 
@@ -736,3 +744,163 @@ def update_return_status(
     db.commit()
     db.refresh(returned_product)
     return returned_product
+
+
+# ---------------------------------------------------------------------------
+# Supplier product submissions (admin approval workflow) & notifications
+# ---------------------------------------------------------------------------
+
+UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads" / "submissions"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _submission_response(db: Session, submission: SupplierProductSubmission) -> dict:
+    supplier = db.get(Supplier, submission.supplier_id)
+    return {
+        "id": submission.id,
+        "supplier_id": submission.supplier_id,
+        "supplier_name": supplier.company_name if supplier else None,
+        "name": submission.name,
+        "brand": submission.brand or "",
+        "category_name": submission.category_name or "",
+        "sku": submission.sku or "",
+        "description": submission.description,
+        "image_url": submission.image_url,
+        "wholesale_price": submission.wholesale_price,
+        "available_stock": submission.available_stock,
+        "warranty_period": submission.warranty_period,
+        "submission_status": submission.submission_status,
+        "rejection_reason": submission.rejection_reason,
+        "admin_selling_price": submission.admin_selling_price,
+        "admin_category_id": submission.admin_category_id,
+        "published_product_id": submission.published_product_id,
+        "submitted_at": submission.submitted_at,
+        "reviewed_at": submission.reviewed_at,
+    }
+
+
+@router.post(
+    "/submissions",
+    response_model=SupplierSubmissionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_supplier_submission(
+    supplier_id: int,
+    name: str = Form(...),
+    brand: str = Form(""),
+    category_name: str = Form(""),
+    sku: str = Form(""),
+    description: str | None = Form(None),
+    wholesale_price: str = Form("0"),
+    available_stock: int = Form(0),
+    warranty_period: str | None = Form(None),
+    image: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+):
+    _require_supplier(db, supplier_id)
+    image_url = None
+    if image and image.filename:
+        ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
+        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            raise HTTPException(status_code=422, detail="Image must be jpg, png, webp, or gif")
+        filename = f"{uuid.uuid4().hex}{ext}"
+        dest = UPLOAD_DIR / filename
+        contents = await image.read()
+        if len(contents) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=422, detail="Image must be 5MB or smaller")
+        with open(dest, "wb") as f:
+            f.write(contents)
+        image_url = f"/uploads/submissions/{filename}"
+
+    try:
+        price = Decimal(str(wholesale_price or "0"))
+    except Exception:
+        price = Decimal("0")
+
+    submission = SupplierProductSubmission(
+        supplier_id=supplier_id,
+        name=name.strip(),
+        brand=(brand or "").strip(),
+        category_name=(category_name or "").strip(),
+        sku=(sku or "").strip(),
+        description=(description or "").strip() or None,
+        image_url=image_url,
+        wholesale_price=price,
+        available_stock=max(0, int(available_stock or 0)),
+        warranty_period=(warranty_period or "").strip() or None,
+        submission_status="Pending",
+    )
+    db.add(submission)
+    db.commit()
+    db.refresh(submission)
+    return _submission_response(db, submission)
+
+
+@router.get("/submissions", response_model=list[SupplierSubmissionResponse])
+def list_supplier_submissions(
+    supplier_id: int,
+    status_filter: str | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_db),
+):
+    _require_supplier(db, supplier_id)
+    stmt = select(SupplierProductSubmission).where(
+        SupplierProductSubmission.supplier_id == supplier_id
+    )
+    if status_filter:
+        stmt = stmt.where(SupplierProductSubmission.submission_status == status_filter)
+    submissions = db.scalars(stmt.order_by(SupplierProductSubmission.id.desc())).all()
+    return [_submission_response(db, s) for s in submissions]
+
+
+@router.get("/notifications", response_model=list[NotificationResponse])
+def list_supplier_notifications(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    stmt = select(Notification).where(
+        or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id)
+    ).order_by(Notification.created_at.desc(), Notification.id.desc())
+    return db.scalars(stmt).all()
+
+
+@router.patch("/notifications/{notification_id}/read", response_model=NotificationResponse)
+def mark_notification_read(
+    supplier_id: int,
+    notification_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    notif = db.scalar(
+        select(Notification).where(
+            Notification.id == notification_id,
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+        )
+    )
+    if notif is None:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    notif.is_read = True
+    db.commit()
+    db.refresh(notif)
+    return notif
+
+
+@router.get("/me/context")
+def get_supplier_context(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    unread = db.scalar(
+        select(func.count()).select_from(Notification).where(
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+            Notification.is_read.is_(False),
+        )
+    )
+    return {
+        "supplier_id": supplier.id,
+        "company_name": supplier.company_name,
+        "contact_person": supplier.contact_person,
+        "email": supplier.email,
+        "unread_notifications": int(unread or 0),
+    }
