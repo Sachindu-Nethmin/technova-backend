@@ -1069,3 +1069,83 @@ def get_supplier_context(
         "email": supplier.email,
         "unread_notifications": int(unread or 0),
     }
+
+
+@router.get("/me/dashboard-summary")
+def get_supplier_dashboard_summary(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    extension = db.get(SupplierProfileExtension, supplier_id)
+    unread = db.scalar(
+        select(func.count()).select_from(Notification).where(
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+            Notification.is_read.is_(False),
+        )
+    )
+    metrics = db.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM supplier_products
+                 WHERE supplier_id = :supplier_id) AS products_catalogued,
+                (SELECT COUNT(*) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS deliveries_to_date,
+                (SELECT COALESCE(SUM(d.total_units), 0) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS units_supplied_to_date,
+                (SELECT COALESCE(SUM(d.total_value), 0) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS value_supplied_to_date,
+                (SELECT COUNT(*) FROM product_returns
+                 WHERE supplier_id = :supplier_id) AS returns_to_date,
+                (SELECT COUNT(*) FROM restock_requests
+                 WHERE supplier_id = :supplier_id
+                   AND status = 'Pending Supplier Approval') AS pending_requests
+            """
+        ),
+        {"supplier_id": supplier_id},
+    ).mappings().one()
+
+    return {
+        "supplier_id": supplier.id,
+        "company_name": supplier.company_name,
+        "contact_person": supplier.contact_person,
+        "email": supplier.email,
+        "phone": supplier.phone,
+        "address": supplier.address,
+        "vendor_code": supplier.vendor_code,
+        "rating": float(supplier.rating) if supplier.rating is not None else None,
+        "contract_status": supplier.contract_status,
+        "city": extension.city if extension else None,
+        "unread_notifications": int(unread or 0),
+        "products_catalogued": int(metrics["products_catalogued"]),
+        "deliveries_to_date": int(metrics["deliveries_to_date"]),
+        "units_supplied_to_date": int(metrics["units_supplied_to_date"]),
+        "value_supplied_to_date": float(metrics["value_supplied_to_date"]),
+        "returns_to_date": int(metrics["returns_to_date"]),
+        "pending_requests": int(metrics["pending_requests"]),
+    }
