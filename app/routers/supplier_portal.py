@@ -1,11 +1,13 @@
 import os
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fpdf import FPDF
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -107,6 +109,169 @@ def _stock_status(stock: int) -> str:
     if stock <= 5:
         return "Low Supply"
     return "In Stock"
+
+
+ReportPeriod = Literal["weekly", "monthly"]
+
+
+def _pdf_text(value: object) -> str:
+    """Core PDF fonts only cover Latin-1; replace anything they cannot render."""
+    return str(value if value is not None else "").encode("latin-1", "replace").decode("latin-1")
+
+
+def _fit_pdf_cell(value: object, width: int) -> str:
+    rendered = _pdf_text(value)
+    return rendered if len(rendered) <= width else f"{rendered[: width - 1]}."
+
+
+def _build_delivered_report_pdf(
+    supplier_name: str,
+    period_label: str,
+    start_date: date,
+    end_date: date,
+    rows: list[dict],
+) -> bytes:
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _pdf_text("TECHNOVA - Delivered Details Report"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, _pdf_text(f"Supplier: {supplier_name}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _pdf_text(f"Period: {period_label}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0,
+        6,
+        _pdf_text(f"From {start_date.isoformat()} to {end_date.isoformat()}"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.cell(
+        0,
+        6,
+        _pdf_text(f"Generated: {datetime.now():%Y-%m-%d %H:%M}"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    widths = (40, 34, 40, 34, 40, 30, 16, 33)
+    headings = (
+        "Dispatch No",
+        "Reference",
+        "Destination",
+        "Delivered At",
+        "Carrier",
+        "Waybill",
+        "Units",
+        "Value (Rs.)",
+    )
+    pdf.set_fill_color(15, 23, 42)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 9)
+    for width, heading in zip(widths, headings):
+        pdf.cell(width, 8, _pdf_text(heading), border=1, fill=True)
+    pdf.ln(8)
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 9)
+    total_units = 0
+    total_value = Decimal("0.00")
+    for row in rows:
+        delivered_at = row.get("delivered_at")
+        delivered_text = (
+            delivered_at.strftime("%Y-%m-%d %H:%M")
+            if hasattr(delivered_at, "strftime")
+            else _pdf_text(delivered_at)
+        )
+        cells = (
+            row.get("dispatch_number"),
+            row.get("reference_no"),
+            row.get("branch_name"),
+            delivered_text,
+            row.get("carrier"),
+            row.get("tracking_number"),
+            row.get("total_units"),
+            f"{Decimal(str(row.get('total_value') or 0)):,.2f}",
+        )
+        for width, value in zip(widths, cells):
+            pdf.cell(width, 7, _fit_pdf_cell(value, width), border=1)
+        pdf.ln(7)
+        total_units += int(row.get("total_units") or 0)
+        total_value += Decimal(str(row.get("total_value") or 0))
+
+    if not rows:
+        pdf.cell(0, 10, _pdf_text("No delivered dispatches in this period."), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, _pdf_text(f"Total deliveries: {len(rows)}    Total units: {total_units}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, _pdf_text(f"Total value: Rs. {total_value:,.2f}"), new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
+
+
+@router.get(
+    "/deliveries/report.pdf",
+)
+def get_delivered_details_report(
+    supplier_id: int,
+    period: ReportPeriod = Query(default="weekly"),
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    today = date.today()
+    if period == "weekly":
+        start_date = today - timedelta(days=7)
+        period_label = "Weekly (last 7 days)"
+    else:
+        start_date = today.replace(day=1)
+        period_label = "Monthly (current calendar month)"
+
+    rows = db.execute(
+        text(
+            """
+            SELECT d.dispatch_number,
+                   COALESCE(po.po_number, rr.request_number) AS reference_no,
+                   b.name AS branch_name,
+                   d.delivered_at,
+                   d.carrier,
+                   d.tracking_number,
+                   d.total_units,
+                   d.total_value
+            FROM deliveries d
+            LEFT JOIN branches b ON b.id = d.branch_id
+            LEFT JOIN purchase_orders po ON po.id = d.purchase_order_id
+            LEFT JOIN restock_requests rr ON rr.id = d.request_id
+            WHERE d.status = 'Delivered & Verified'
+              AND d.delivered_at >= :start_date
+              AND d.delivered_at < :end_date
+              AND (po.supplier_id = :supplier_id OR rr.supplier_id = :supplier_id)
+            ORDER BY d.delivered_at DESC
+            """
+        ),
+        {
+            "start_date": start_date,
+            "end_date": today + timedelta(days=1),
+            "supplier_id": supplier_id,
+        },
+    ).mappings().all()
+
+    pdf_bytes = _build_delivered_report_pdf(
+        supplier.company_name,
+        period_label,
+        start_date,
+        today,
+        [dict(row) for row in rows],
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="delivered-details-{period}-{today.isoformat()}.pdf"',
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.get(
