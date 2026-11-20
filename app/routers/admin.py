@@ -3,7 +3,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,8 @@ from app.schemas.admin import (
     SavedReportUpdate,
 )
 from app.schemas.supplier_portal import (
+    LowStockAlertCreate,
+    NotificationResponse,
     SubmissionApproveRequest,
     SubmissionRejectRequest,
 )
@@ -1634,3 +1636,83 @@ def reject_supplier_submission(
             pass
 
     return _submission_json(db, submission)
+
+
+@router.post(
+    "/api/admin/low-stock-alerts",
+    response_model=NotificationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def send_low_stock_alert(
+    payload: LowStockAlertCreate,
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, payload.product_id)
+    if product is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    if product.stock_count > product.min_stock_level:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="This product is not currently low on stock",
+        )
+
+    # The local catalogue links products to suppliers through this table.
+    supplier_id = db.execute(
+        text(
+            """
+            SELECT supplier_id
+            FROM supplier_products
+            WHERE product_id = :product_id
+            ORDER BY id
+            LIMIT 1
+            """
+        ),
+        {"product_id": product.id},
+    ).scalar_one_or_none()
+    if supplier_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No supplier is linked to this product",
+        )
+    supplier = db.get(Supplier, supplier_id)
+    if supplier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Supplier not found",
+        )
+
+    # Avoid flooding the supplier if the admin clicks more than once.
+    cutoff = datetime.now() - timedelta(hours=24)
+    existing = db.scalar(
+        select(Notification).where(
+            Notification.supplier_id == supplier.id,
+            Notification.type == "low_stock",
+            Notification.related_type == "product",
+            Notification.related_id == product.id,
+            Notification.is_read.is_(False),
+            Notification.created_at >= cutoff,
+        )
+    )
+    if existing is not None:
+        return existing
+
+    default_message = (
+        f"{product.name} (SKU {product.sku}) has {product.stock_count} units left, "
+        f"below the minimum of {product.min_stock_level}. Please arrange a restock."
+    )
+    notification = Notification(
+        user_id=supplier.user_id or 0,
+        supplier_id=supplier.id,
+        type="low_stock",
+        title=f"Low stock alert: {product.name}",
+        message=(payload.message or default_message).strip(),
+        related_type="product",
+        related_id=product.id,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    return notification
