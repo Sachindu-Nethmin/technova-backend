@@ -393,3 +393,11 @@ class NotificationResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class LowStockAlertCreate(BaseModel):
+
+    product_id: int
+    message: str | None = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
